@@ -1,0 +1,507 @@
+---
+title: "NHANES BMI Summary 2018"
+author: "Rachel Tao"
+date: "10/9/2021"
+output: github_document
+---
+
+I want to know if education was associated with obesity in 2018. To do this, I'll use the NHANES data from the 2017-2018 cycle. Since I think that gender, age, and race are probably also associated with obesity, I will look at those variables too.
+
+For this analysis, I am using R because it has excellent data wrangling capabilities, and RMarkdown allows for the efficient generation of a digestible yet informative report. Although NHANES data are in *.xpt file format, which are meant to be read into SAS, I still believe that R is preferable because so much data wrangling is needed for NHANES data, and R has more tools for efficient data wrangling than SAS. R is also open-source, which allows for greater reproducibility. I have created a git repository for this project in github for version control. I could use github to share my code publicly, allowing for others to learn from what I am doing, and for the possibility that someone might see my code and make suggestions for how I can improve it. Github also allows for code sharing among team-members, which is essential for any health analysis, though privacy concerns must be taken into account when using Github.
+
+```{r setup}
+library(tidyverse)
+library(tidylog)
+library(SASxport)
+library(kableExtra) 
+library(ggplot2)
+library(aod)
+
+knitr::opts_chunk$set(
+	fig.asp = 0.6,
+	message = FALSE,
+	warning = FALSE,
+	out.width = "90%"
+)
+```
+
+## Load in NHANES datasets
+
+```{r load data}
+
+BMI_data <- read.xport("./BMX_J.XPT") %>% 
+  select(
+    SEQN, 
+    BMDSTATS,
+    BMXWT,
+    BMIWT,
+    BMXHT,
+    BMIHT
+  ) %>% 
+  rename(
+    completeness = BMDSTATS,
+    weight_kg = BMXWT,
+    weight_notes = BMIWT,
+    height_cm = BMXHT,
+    height_notes = BMIHT
+  )
+
+nrow(BMI_data)
+
+demo_data <- read.xport("./DEMO_J.XPT") %>% 
+  select(
+    SEQN,
+    SDDSRVYR,
+    RIDSTATR,
+    RIAGENDR,
+    RIDAGEYR,
+    WTMEC2YR,
+    SDMVPSU,
+    SDMVSTRA,
+    RIDEXPRG,
+    RIDRETH3,
+    DMDEDUC2
+  ) %>% 
+  rename(
+    release_cycle = SDDSRVYR,
+    examined = RIDSTATR,
+    gender = RIAGENDR,
+    age_years = RIDAGEYR,
+    exam_weight_2yr = WTMEC2YR,
+    pseudo_PSU = SDMVPSU,
+    pseudo_stratum = SDMVSTRA,
+    pregnant = RIDEXPRG,
+    race = RIDRETH3,
+    education = DMDEDUC2
+  )
+
+nrow(demo_data)
+
+```
+
+
+## Merge data into one dataset and do preliminary cleaning to look at data
+
+```{r clean data, warning=FALSE}
+
+nhanes_bmi_full <- inner_join(demo_data, BMI_data, by = "SEQN")
+
+labelled::generate_dictionary(nhanes_bmi_full)
+
+nhanes_bmi_full <- nhanes_bmi_full %>% 
+  as_tibble() %>% 
+  mutate(
+    examined = as_factor(examined),
+    examined = fct_recode(examined, 
+                          yes = "2", 
+                          no = "1" 
+                          ),
+    gender = as_factor(gender),
+    gender = fct_recode(gender, 
+                        female = "2", 
+                        male = "1"
+                        ),
+    completeness = as_factor(completeness),
+    completeness = fct_recode(completeness, # recode body measurement completeness
+                              complete = "1",
+                              ht_wt_only = "2",
+                              other_partial = "3",
+                              no_measures = "4"
+                              ),
+    weight_notes = as_factor(weight_notes),
+    weight_notes = fct_recode(weight_notes,
+                              no_measure = "1",
+                              clothing = "3",
+                              medical_appliance = "4"
+                              ),
+    height_notes = as_factor(height_notes),
+    height_notes = fct_recode(height_notes,
+                              no_measure = "1",
+                              not_straight = "3"
+                              ),
+    pregnant = as_factor(pregnant),
+    pregnant = fct_recode(pregnant, 
+                           pregnant = "1", 
+                           not_pregnant = "2", 
+                           unsure = "3"
+                          ),
+    race = as_factor(race),
+    race = fct_recode(race,
+                      hispanic = "1", # coding "Mexican American" as hispanic
+                      hispanic = "2", # coding "other Hispanic" as hispanic
+                      white = "3", # coding "non-Hispanic white" as white
+                      black = "4", # coding "non-Hispanic Black" as black
+                      asian = "6", # coding "non-Hispanic Asian" as asian
+                      other = "7" # coding "Other - Including Multi-racial" as other
+                      ),
+    education = as_factor(education),
+    education = fct_recode(education,
+                           K_12 = "1", # coding <9th grade as K_12
+                           K_12 = "2", # coding 9th-11th grade as K_12
+                           high_school = "3", # coding high school grad as high_school
+                           some_college = "4", # coding some college as some_college
+                           college_grad = "5", # coding college graduate or higher as college_grad
+                           refused = "7",
+                           unsure = "9"
+                           )
+  )
+
+summary(nhanes_bmi_full)
+
+```
+
+Data summary:
+
+ -  It looks like all of our data are in the correct release cycle (year 10, 2017-2018 year)
+ -  As expected, everyone in our dataset was both examined and interviewed
+ - No missing gender values
+ - No missing age, we will need to restrict to 20 and above since we have data for those under 20
+ - According to the documentation, we only have pregnancy data for females 20-44, and of those only 55 were pregnant and 36 were unsure.
+ - for both race and education, it looks like we lost a few observations from people who were included in the demographics dataset but not in the body measurements dataset. Given that, these values look reasonable.
+ - We have a lot of missing values for education. Let's look at this further once we've removed other observations we don't need, since it's likely that this is because the education categories only apply to ages 20+
+ - Most of the BMI data are complete, but there are 283 people who had partial measures other than "height and weight only" and 107 people who did not have any measures
+ - Weight data look reasonable given that children are included, with 124 missing values
+ - Height data look reasonable given that children are included, with 688 missing values. Unclear why there are so many more missing values compared to the sum of other_partial and no_measures in the "completeness" variable
+ - It will be important to consider the weight and height notes when we do the analysis, and it may be a good idea to do a sensitivity analysis both including and excluding those with clothing and medical appliances, as well as those who were not standing straight
+ 
+Note: In a more in-depth analysis we would use exam_weight_year2, pseudo_PSU, and pseudo_stratum to account for specifics of the NHANES study design. I have therefore included them in the main dataset for this analysis. However, I will not do this additional analysis here, and will simply state that in order to interpret NHANES data accurately, we would in a real analysis want to use these variables. I will therefore delete these variables in the future steps.
+
+## Taking a closer look at the data and missingness
+
+```{r}
+
+nhanes_bmi <- nhanes_bmi_full %>% 
+  select(-release_cycle, -examined, -exam_weight_2yr, -pseudo_PSU, -pseudo_stratum) %>% 
+  filter(
+    age_years >= 20, # remove anyone less than age 20
+    pregnant %in% c("not_pregnant", "unsure", NA), # remove pregnant people, since BMI is not comparable with non-pregnant people
+    education %in% c("K_12", "high_school", "some_college", "college_grad", NA)
+  )
+
+summary(nhanes_bmi)
+
+# It looks like after filtering out children from our dataset, we have no missing
+# values for education.
+
+nhanes_bmi %>% 
+  filter(completeness != "complete") %>% 
+  select(completeness, weight_notes, height_notes, weight_kg, height_cm) %>% 
+  arrange(completeness, height_notes, weight_notes) # %>%
+  # view()
+
+# looking at each category of the variable "completeness":
+# looks like height_weight_only does have measures for both weight and height for all values
+# several other_partial are missing height or weight, but not all
+# no_measures is accurate
+
+# therefore, we can omit all observations where completeness = no_measures
+# we can keep all observations where completeness = height_weight_only
+# we should keep other_partial and further omit based on weight_notes and height_notes
+
+# now let's check to see if things are adding up
+
+nhanes_bmi %>% 
+  group_by(completeness, weight_notes, height_notes) %>% 
+  summarize(count = n())
+
+# looks like all 78 NAs for height are accounted for with a combination of height_notes and completeness
+# only 73 of the 78 NAs for weight are accounted for with a combination of weight_notes and completeness
+# let's see where the other 5 might be:
+
+nhanes_bmi %>% 
+  filter(
+    is.na(weight_kg),
+    weight_notes %in% c("clothing", "medical_appliance", NA),
+    completeness %in% c("complete", "ht_wt_only", "other_partial", NA)) %>% 
+  select(completeness, weight_notes, weight_kg)
+
+
+```
+
+Based on the above, I feel comfortable assuming that heights and weights in the "complete" and "height_weight_only" categories of completeness are valid entries. I can also see that there are only five missing values for weight that are not explained, and these are all in the "other_partial" category of completeness. Therefore, I will omit observations in the "no_measures" category of completion, observations in the "no_measure" category of weight_notes and height_notes, as well as all other observations that have missing values for height or weight, without worrying excessively about unexplained missingness.
+
+I will also choose to omit observations in the "medical_appliance" category of weight_notes, as medical appliances can be quite heavy, and this could lead to measurement inaccuracy/non-comparability. I will retain observations in the "clothing" category of weight_notes and the "not_straight" category of height_notes, because I do not think these would contribute as heavily to inaccuracy as medical appliances. In a more in-depth analysis, I would want to speak with someone who might know more than me about how much these could contribute to inaccuracy.
+
+## Data Cleaning and New Variable Creation
+
+```{r}
+
+nhanes_bmi <- nhanes_bmi %>% 
+  filter(
+    completeness %in% c("complete", "ht_wt_only", "other_partial", NA),
+    weight_notes %in% c("clothing", NA),
+    height_notes %in% c("not_straight", NA),
+  ) %>% 
+  drop_na(weight_kg, height_cm) %>% # drop missing obs from weight and height
+  select(-pregnant, -completeness, -weight_notes, -height_notes) %>% #remove unneeded variables
+  mutate(
+    height_m = height_cm*0.01, # put height into meters to calculate BMI
+    bmi = weight_kg/(height_m)^2, # calculate BMI
+    bmi_cat = cut(bmi, 
+                  breaks = c(0, 18.5, 25, 30, 40, Inf), 
+                  labels = c("underweight", "normal_weight", "overweight", "obese", "extreme_obese"),
+                  right = FALSE), # categorize BMI
+    age_cat = cut(age_years,
+                  breaks = c(19, 30, 40, 50, 60, 70, 80, Inf),
+                  labels = c("20-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80+"), # create age categories
+                  right = FALSE)
+  )
+
+summary(nhanes_bmi)
+
+```
+
+## Let's take a look at our data, now that it's cleaned
+
+```{r}
+
+mean_bmi_gender <- nhanes_bmi %>% 
+  group_by(gender) %>% 
+  summarize(mean = mean(bmi),
+            sd = sd(bmi))
+
+gender_tot <- nhanes_bmi %>% 
+  group_by(gender) %>% 
+  summarize(total = n()) 
+
+bmi_cat_summary <- nhanes_bmi %>% 
+  group_by(gender, bmi_cat) %>% 
+  summarize(count = n()) %>% 
+  left_join(gender_tot) %>% 
+  mutate(
+    prevalence = count/total
+  )
+
+gender_age_tot <- nhanes_bmi %>% 
+  group_by(gender, age_cat) %>% 
+  summarize(total = n())
+
+bmi_cat_age_summary <- nhanes_bmi %>% 
+  group_by(gender, age_cat, bmi_cat) %>% 
+  summarize(count = n()) %>% 
+  right_join(gender_age_tot) %>% 
+  mutate(
+    prevalence = count/total
+  )
+
+gender_race_tot <- nhanes_bmi %>% 
+  group_by(gender, race) %>% 
+  summarize(total = n())
+
+bmi_cat_race_summary <- nhanes_bmi %>% 
+  select(-age_cat) %>% 
+  group_by(gender, race, bmi_cat) %>% 
+  summarize(count = n()) %>% 
+  right_join(gender_race_tot) %>% 
+  mutate(
+    prevalence = count/total
+  )
+
+gender_education_tot <- nhanes_bmi %>% 
+  group_by(gender, education) %>% 
+  summarize(total = n())
+
+bmi_cat_education_summary <- nhanes_bmi %>% 
+  group_by(gender, education, bmi_cat) %>% 
+  summarize(count = n()) %>% 
+  right_join(gender_education_tot) %>% 
+  mutate(
+    prevalence = count/total
+  )
+
+```
+
+## Let's make it nicer to look at
+
+```{r}
+
+mean_bmi_gender %>% ggplot(aes(x = gender, y = mean, fill = gender)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.4) +
+  theme_classic() +
+  xlab("") +
+  ylab("Mean BMI") +
+  labs(
+    title = "Average BMI by gender",
+    subtitle = "NHANES 2018",
+    caption = "Error bars show 1SD"
+  )
+  
+
+bmi_cat_summary %>% 
+  select(gender, bmi_cat, prevalence) %>% 
+  mutate(
+    prevalence = round(prevalence, digits = 3)
+  ) %>% 
+  pivot_wider(names_from = gender,
+              values_from = prevalence) %>% 
+  mutate(
+    bmi_cat = fct_recode(bmi_cat,
+    "Underweight" = "underweight",
+    "Normal Weight" = "normal_weight",
+    "Overweight" = "overweight",
+    "Obese" = "obese",
+    "Extreme obese" = "extreme_obese"
+  )) %>% 
+  rename("BMI Category" = bmi_cat,
+         Male = male,
+         Female = female) %>% 
+  kable()
+
+bmi_cat_race_summary %>% 
+  select(gender, bmi_cat, race, prevalence) %>% 
+  mutate(
+    prevalence = round(prevalence, digits = 3)
+  ) %>% 
+  pivot_wider(names_from = gender,
+              values_from = prevalence) %>% 
+  # mutate_all(~replace(., is.na(.), 0)) %>% # we had one category with no people in it, so we will convert the NA to 0
+  mutate(
+    bmi_cat = fct_recode(
+      bmi_cat,
+      "Underweight" = "underweight",
+      "Normal Weight" = "normal_weight",
+      "Overweight" = "overweight",
+      "Obese" = "obese",
+      "Extreme obese" = "extreme_obese"),
+    race = fct_recode(
+      race,
+      "Hispanic" = "hispanic",
+      "White" = "white",
+      "Black" = "black",
+      "Asian" = "asian",
+      "Other" = "other"
+  )) %>% 
+  rename("BMI Category" = bmi_cat,
+         Male = male,
+         Female = female,
+         "Race Category" = race) %>% 
+  kable()
+
+bmi_cat_age_summary %>% 
+  mutate(
+     bmi_cat = fct_recode(
+      bmi_cat,
+      "Underweight" = "underweight",
+      "Normal Weight" = "normal_weight",
+      "Overweight" = "overweight",
+      "Obese" = "obese",
+      "Extreme obese" = "extreme_obese")) %>% 
+  ggplot(aes(x = bmi_cat, y = prevalence)) +
+  geom_col(aes(fill = gender), position = "dodge") +
+  facet_grid(rows = vars(age_cat)) +
+  xlab("") +
+  ylab("Prevalence") +
+  theme(strip.text = element_text(size = 5)) +
+  theme_classic() +
+  labs(
+    title = "Prevalence of each BMI category by age and gender",
+    subtitle = "NHANES 2018",
+    caption = "Prevalence shown at left, age category shown at right"
+  )
+
+bmi_cat_education_summary %>% 
+  mutate(
+    education = fct_recode(
+      education,
+      "K-12" = "K_12",
+      "High School" = "high_school",
+      "Some College" = "some_college",
+      "College Graduate" = "college_grad"),
+    bmi_cat = fct_recode(
+      bmi_cat,
+      "Underweight" = "underweight",
+      "Normal Weight" = "normal_weight",
+      "Overweight" = "overweight",
+      "Obese" = "obese",
+      "Extreme obese" = "extreme_obese")) %>% 
+  ggplot(aes(x = bmi_cat, y = prevalence)) +
+  geom_col(aes(fill = gender), position = "dodge") +
+  facet_grid(rows = vars(education)) +
+  xlab("") +
+  ylab("Prevalence") +
+  theme_classic() +
+  labs(
+    title = "Prevalence of each BMI category by education and gender",
+    subtitle = "NHANES 2018",
+    caption = "Prevalence shown at left, education category shown at right"
+  )
+  
+
+```
+
+## Time to answer our research question:
+
+Is education associated with obesity, adjusting for age, race, and gender as potential confounders?
+
+```{r}
+
+# I want to use logistic regression, so I will dichotomize my outcome variable,
+# BMI, into "obese" versus "not obese"
+
+nhanes_bmi <- nhanes_bmi %>% 
+  mutate(
+    obesity = if_else(bmi_cat %in% c("obese", "extreme_obese"), "obese", "not_obese"),
+    obesity = as_factor(obesity),
+    obesity = relevel(obesity, ref = "not_obese")
+  )
+
+logit_model <- glm(
+  obesity ~ relevel(education, ref = "K_12") + relevel(race, ref = "white") + gender + age_years, 
+  data = nhanes_bmi, 
+  family = "binomial")
+
+summary(logit_model)
+
+# Based on the summary, we can see that some of the coefficients for our categorical
+# variables look like they are statistically significant.
+# but we cannot tell if this is meaningful without doing Likelihood Ratio Test
+
+anova(object = logit_model, test = "Chisq")
+
+```
+
+Based on the LRT for our logistic model, we can conclude that in 2018, there was a statistically significant association between education and obesity, adjusting for race, age, and gender.
+
+Now, let's look at the values themselves:
+
+```{r}
+
+# Extract coefficient matrix
+
+coeff.mat <- summary(logit_model)$coef
+
+# Extract the coefficient and standard error 
+
+results <- tibble(
+  education = c("High School", "Some College", "College Grad"),
+  coeff = c(coeff.mat[2, 1], coeff.mat[3, 1], coeff.mat[4, 1]),
+  se = c(coeff.mat[2, 2], coeff.mat[3, 2], coeff.mat[4, 2]))
+
+# Exponentiate coefficient & CI
+# since the logistic model transforms the outcome into the log of the odds
+# we can compute the odds ratio by exponentiating the coefficients 
+# in R exp(a) means 'e to the power of a'
+
+results <- results %>% 
+  mutate(
+    OR = exp(coeff),
+    lci.or = exp(coeff - 1.96*se),
+    uci.or = exp(coeff + 1.96*se)
+  )
+
+results %>% kable()
+
+```
+
+In 2018, adjusting for age, gender, and race, the odds of obesity were 30% higher in those who completed some college compared to those who did not finish high school, on average. We are 95% confident that the odds of obesity  are between 9% and 54% higher in those who completed some college, compared to those who did not finish high school.
+
+Adjusting for age, gender, and race, the odds of obesity were 15% higher for those who completed only high school compared with those who did not finish high school, and 5.9% lower in those who completed college compared to those who did not finish high school, on average. However, these results were not statistically significant, and should be interpreted with caution. We are 95% confident that the true odds ratio comparing odds of obesity among those who finished high school versus those who did not is between 0.959 and 1.37. We are 95% confident that the true odds ratio comparing odds of obesity among those who finished college versus those who did not is between 0.778 and 1.14. 
+
+These results indicate that there may be a relationship between education and obesity, but this relationship may not be monotonic. It is also possible that we did not fully capture the true associations due to randomness, or limitations of this analysis. Here are some things I might want to look at in future analyses in order to investigate this relationship more carefully:
+
+ - Incorporate sample weights according to NHANES study design
+ - Look at multiple years of NHANES to see if there are trends over time, and also to increase statistical power through inclusion of more data
+ - Sensitivity analyses with different definitions of obesity (including or excluding "overweight" category) and inclusion vs. exclusion of observations with notes such as "not straight" for height and "clothing" for weight
+ - Considerations of other potential confounders, such as household income
+ 
